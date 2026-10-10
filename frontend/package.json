@@ -1,0 +1,30 @@
+{
+  "name": "nabd",
+  "version": "1.1.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test:ui": "playwright test",
+    "ios:sync": "npm run build && cap sync ios"
+  },
+  "dependencies": {
+    "@capacitor/core": "^7.4.5",
+    "@capacitor/ios": "^7.4.5",
+    "lightweight-charts": "^5.0.9",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.4.5",
+    "@playwright/test": "^1.64.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.4.0",
+    "typescript": "~5.8.3",
+    "vite": "^6.3.5"
+  }
+}

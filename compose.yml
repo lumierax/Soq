@@ -1,0 +1,17 @@
+services:
+  nabd:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+    environment:
+      NABD_DATA_DIR: /app/data
+      BOT_DB_PATH: /app/data/bot.sqlite3
+    # Keep the control plane behind your HTTPS reverse proxy.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - nabd-data:/app/data
+    stop_grace_period: 30s
+volumes:
+  nabd-data:

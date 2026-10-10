@@ -1,0 +1,127 @@
+name: Import NABD and build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign_ipa:
+        description: 'Apple-sign the IPA using repository certificate/profile secrets'
+        type: boolean
+        required: true
+        default: false
+      export_method:
+        description: 'Must match your Apple provisioning profile'
+        type: choice
+        required: true
+        default: ad-hoc
+        options:
+          - ad-hoc
+          - development
+          - app-store
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nabd-mobile-import-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NABD_ARCHIVE_SHA256: '__ARCHIVE_SHA256__'
+
+jobs:
+  import-and-build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out the selected repository branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python for archive verification
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify and import the source ZIP
+        shell: bash
+        run: |
+          python3 - <<'NABD_IMPORT_PY'
+          # __EMBED_IMPORTER__
+          NABD_IMPORT_PY
+
+      - name: Commit imported sources without changing workflow files
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- . ':!.github/workflows'
+          if ! git diff --cached --quiet; then
+            git -c core.hooksPath=/dev/null commit -m 'Import verified NABD app sources'
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          else
+            printf '%s\n' 'Sources already imported; no source edits were overwritten.'
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Ruby for optional Apple signing
+        if: inputs.sign_ipa
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Install project signing helper
+        if: inputs.sign_ipa
+        run: gem install xcodeproj -v 1.27.0 --no-document
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          if [ -d /Applications/Xcode_16.4.app/Contents/Developer ]; then
+            sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Install locked web dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build iPhone archive and IPA
+        id: build
+        shell: bash
+        env:
+          SIGN_IPA: ${{ inputs.sign_ipa }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          if [ "$SIGN_IPA" = 'true' ]; then
+            bash scripts/build-ios.sh --signed --export-method "$EXPORT_METHOD"
+          else
+            bash scripts/build-ios.sh --unsigned
+          fi
+
+      - name: Upload iPhone archive and IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.artifact_name }}
+          path: build/ios/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build diagnostics after failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nabd-iOS-build-diagnostics
+          path: build/ios/*.log
+          if-no-files-found: ignore
+          retention-days: 3

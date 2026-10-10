@@ -1,0 +1,14 @@
+.git
+.venv
+**/node_modules
+frontend/dist
+frontend/ios
+**/.env
+**/data
+**/__pycache__
+**/.pytest_cache
+build
+artifacts
+*.zip
+*.ipa
+library-files
