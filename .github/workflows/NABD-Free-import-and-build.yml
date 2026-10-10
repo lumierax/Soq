@@ -1,0 +1,340 @@
+name: Import NABD and build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign_ipa:
+        description: 'Apple-sign the IPA using repository certificate/profile secrets'
+        type: boolean
+        required: true
+        default: false
+      export_method:
+        description: 'Must match your Apple provisioning profile'
+        type: choice
+        required: true
+        default: ad-hoc
+        options:
+          - ad-hoc
+          - development
+          - app-store
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nabd-mobile-import-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NABD_ARCHIVE_SHA256: 'f61d5163f3cc9952f966a3391dea7663cd4ee6ff80b595ee4fde201a0119c5b0'
+
+jobs:
+  import-and-build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out the selected repository branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python for archive verification
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify and import the source ZIP
+        shell: bash
+        run: |
+          python3 - <<'NABD_IMPORT_PY'
+          """Import the verified mobile source ZIP without touching GitHub workflow files.
+          
+          This file is embedded into workflow.template.yml by render_workflow.py so the
+          downloaded workflow can run before the repository has any extracted sources.
+          """
+          from __future__ import annotations
+          
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import stat
+          import tempfile
+          import unicodedata
+          import zipfile
+          from pathlib import Path
+          
+          
+          ARCHIVE_NAME = "NABD-Free-iOS-GitHub.zip"
+          MARKER_NAME = ".nabd-mobile-import.json"
+          BACKUP_NAME = ".nabd-mobile-import-backup/README.md"
+          MAX_ARCHIVE = 25 * 1024 * 1024
+          MAX_FILE = 25 * 1024 * 1024
+          MAX_TOTAL = 100 * 1024 * 1024
+          MAX_ENTRIES = 2000
+          REQUIRED = {
+              "frontend/package.json", "frontend/package-lock.json",
+              "frontend/capacitor.config.ts", "scripts/build-ios.sh",
+              "frontend/ios/App/App.xcodeproj/project.pbxproj",
+              "frontend/ios/App/CapApp-SPM/Package.swift", "backend/app/main.py",
+          }
+          
+          
+          class ImportError(ValueError):
+              pass
+          
+          
+          def archive_digest(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+          
+          
+          def safe_target(root: Path, relative: str) -> Path:
+              target = root.joinpath(*relative.split("/"))
+              for parent in (target, *target.parents):
+                  if parent == root:
+                      break
+                  if parent.is_symlink():
+                      raise ImportError("Repository has a symlink in an import destination")
+              if not target.resolve().is_relative_to(root):
+                  raise ImportError("Import destination escapes the repository")
+              return target
+          
+          
+          def read_manifest(archive: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
+              entries = archive.infolist()
+              if not entries or len(entries) > MAX_ENTRIES:
+                  raise ImportError("Source archive entry count is invalid")
+              if sum(item.file_size for item in entries) > MAX_TOTAL:
+                  raise ImportError("Source archive exceeds the 100 MiB extracted-size limit")
+              normalized: dict[str, str] = {}
+              exact: set[str] = set()
+              files: list[tuple[zipfile.ZipInfo, str]] = []
+              for item in entries:
+                  raw = item.filename
+                  if len(raw) > 512 or "\\" in raw or "\0" in raw or raw.startswith("/"):
+                      raise ImportError("Unsafe archive path")
+                  name = raw[:-1] if item.is_dir() else raw
+                  parts = name.split("/")
+                  if any(part in ("", ".", "..") or ":" in part for part in parts):
+                      raise ImportError("Unsafe archive path")
+                  if parts[0] != "NABD" or (len(parts) == 1 and not item.is_dir()):
+                      raise ImportError("Every archive entry must be inside the NABD/ directory")
+                  if name in exact:
+                      raise ImportError("Duplicate archive entry")
+                  exact.add(name)
+                  for length in range(1, len(parts) + 1):
+                      spelling = "/".join(parts[:length])
+                      key = unicodedata.normalize("NFC", spelling).casefold()
+                      if key in normalized and normalized[key] != spelling:
+                          raise ImportError("Case or Unicode-colliding archive paths")
+                      normalized[key] = spelling
+                  mode = item.external_attr >> 16
+                  kind = stat.S_IFMT(mode)
+                  allowed = (0, stat.S_IFDIR) if item.is_dir() else (0, stat.S_IFREG)
+                  if kind not in allowed:
+                      raise ImportError("Symlinks and special files are not allowed in the source archive")
+                  if item.flag_bits & 1:
+                      raise ImportError("Encrypted source archives are not supported")
+                  if item.file_size > MAX_FILE or (item.file_size and item.compress_size == 0):
+                      raise ImportError("Source archive contains an oversized or invalid file")
+                  if item.file_size > max(item.compress_size, 1) * 1000:
+                      raise ImportError("Source archive compression ratio exceeds the safety limit")
+                  if len(parts) == 1:
+                      continue
+                  relative = "/".join(parts[1:])
+                  folded = [part.casefold() for part in parts[1:]]
+                  folded_relative = relative.casefold()
+                  if ".git" in folded or folded_relative == MARKER_NAME or folded_relative == ".nabd-mobile-import-backup" or folded_relative.startswith(".nabd-mobile-import-backup/"):
+                      raise ImportError("Source archive contains reserved repository metadata")
+                  if any(part in (".env", ".app-token") for part in folded) or re.search(r"\.(?:db|sqlite\d*|p12|pfx|mobileprovision|pem|key)(?:-(?:wal|shm))?$", relative, re.I):
+                      raise ImportError("Source archive contains runtime data or signing credentials")
+                  # GitHub's default workflow token cannot create/update workflow files.
+                  # Preserve all workflows created by the user in the browser.
+                  if folded[:2] == [".github", "workflows"]:
+                      continue
+                  if not item.is_dir():
+                      files.append((item, relative))
+              paths = {relative for _, relative in files}
+              if not REQUIRED <= paths:
+                  raise ImportError("Source archive is missing required app/native/build files")
+              for path in paths:
+                  if any(parent.as_posix() in paths for parent in Path(path).parents if parent.as_posix() != "."):
+                      raise ImportError("Archive has a file/directory path collision")
+              return files
+          
+          
+          def import_archive(root: Path, expected_hash: str, *, repository_name: str = "") -> dict:
+              root = root.resolve()
+              if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+                  raise ImportError("Archive hash is not configured. Upload the separate downloaded workflow, not the template inside the ZIP.")
+              source = root / ARCHIVE_NAME
+              if source.is_symlink() or not source.is_file():
+                  raise ImportError(f"Upload {ARCHIVE_NAME} to the repository root first")
+              if source.stat().st_size > MAX_ARCHIVE:
+                  raise ImportError("Source ZIP exceeds the 25 MiB upload-size limit")
+              digest = archive_digest(source)
+              if digest != expected_hash.lower():
+                  raise ImportError("ZIP does not match this workflow. Upload both files from the same download release.")
+              marker_path = safe_target(root, MARKER_NAME)
+              if marker_path.exists():
+                  try:
+                      marker = json.loads(marker_path.read_text())
+                  except (ValueError, OSError) as error:
+                      raise ImportError("Existing import marker is invalid; automatic overwrite is refused") from error
+                  if not isinstance(marker, dict) or type(marker.get("file_count")) is not int or not 1 <= marker["file_count"] <= MAX_ENTRIES:
+                      raise ImportError("Existing import marker is invalid; automatic overwrite is refused")
+                  if marker.get("schema") != 1 or marker.get("archive_sha256") != digest:
+                      raise ImportError("This repository was imported from another archive; automatic overwrite is refused")
+                  if not all(safe_target(root, relative).is_file() for relative in REQUIRED):
+                      raise ImportError("Previously imported sources are incomplete; automatic overwrite is refused")
+                  return {"already_imported": True, "file_count": marker["file_count"], "archive_sha256": digest}
+          
+              try:
+                  with zipfile.ZipFile(source) as archive:
+                      manifest = read_manifest(archive)
+                      scaffold: Path | None = None
+                      top_directories = {relative.split("/")[0] for _, relative in manifest if "/" in relative}
+                      for directory in top_directories - {".github"}:
+                          target = safe_target(root, directory)
+                          if target.exists() and (not target.is_dir() or any(target.iterdir())):
+                              raise ImportError("Repository already contains source directories; no files were overwritten")
+                      for _, relative in manifest:
+                          target = safe_target(root, relative)
+                          if target.exists():
+                              if relative != "README.md" or not target.is_file() or target.stat().st_size > 4096:
+                                  raise ImportError("Repository contains a conflicting source file; no files were overwritten")
+                              text = target.read_text()
+                              heading = text.splitlines()[0] if text.splitlines() else ""
+                              if not repository_name or heading.casefold() != ("# " + repository_name).casefold():
+                                  raise ImportError("Existing README is not the initial GitHub scaffold; automatic overwrite is refused")
+                              scaffold = target
+                          for parent in target.parents:
+                              if parent == root:
+                                  break
+                              if parent.exists() and not parent.is_dir():
+                                  raise ImportError("Import parent path is a file; no files were overwritten")
+                      if scaffold is not None and safe_target(root, BACKUP_NAME).exists():
+                          raise ImportError("Initial README backup already exists; automatic overwrite is refused")
+                      # Validate/read every file (including ZIP CRCs) before changing the repo.
+                      with tempfile.TemporaryDirectory(prefix="nabd-source-import-") as temporary:
+                          staging = Path(temporary)
+                          for item, relative in manifest:
+                              staged = staging.joinpath(*relative.split("/"))
+                              staged.parent.mkdir(parents=True, exist_ok=True)
+                              with archive.open(item) as stream, staged.open("wb") as output:
+                                  shutil.copyfileobj(stream, output, 1024 * 1024)
+                              if staged.stat().st_size != item.file_size:
+                                  raise ImportError("Source archive file size mismatch")
+                              staged.chmod(0o755 if (item.external_attr >> 16) & 0o111 else 0o644)
+                          if scaffold is not None:
+                              backup = safe_target(root, BACKUP_NAME)
+                              backup.parent.mkdir(parents=True, exist_ok=True)
+                              shutil.copyfile(scaffold, backup)
+                              backup.chmod(0o644)
+                          for _, relative in manifest:
+                              target = safe_target(root, relative)
+                              target.parent.mkdir(parents=True, exist_ok=True)
+                              shutil.copy2(staging.joinpath(*relative.split("/")), target)
+              except zipfile.BadZipFile as error:
+                  raise ImportError("Source ZIP is corrupt or has an invalid checksum") from error
+              marker = {"schema": 1, "archive_sha256": digest, "file_count": len(manifest)}
+              marker_path.write_text(json.dumps(marker, indent=2) + "\n")
+              return {"already_imported": False, **marker}
+          
+          
+          def main() -> None:
+              try:
+                  result = import_archive(Path.cwd(), os.environ.get("NABD_ARCHIVE_SHA256", ""),
+                                          repository_name=os.environ.get("GITHUB_REPOSITORY", "").rsplit("/", 1)[-1])
+              except (ImportError, OSError, UnicodeError, KeyError, zipfile.LargeZipFile) as error:
+                  raise SystemExit("Source import stopped: " + str(error)) from None
+              if result["already_imported"]:
+                  print("Verified earlier import; preserving existing source edits.")
+              else:
+                  print(f"Verified ZIP; imported {result['file_count']} source files. User-created workflows were preserved.")
+          
+          
+          if __name__ == "__main__":
+              main()
+          NABD_IMPORT_PY
+
+      - name: Commit imported sources without changing workflow files
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- . ':!.github/workflows'
+          if ! git diff --cached --quiet; then
+            git -c core.hooksPath=/dev/null commit -m 'Import verified NABD app sources'
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          else
+            printf '%s\n' 'Sources already imported; no source edits were overwritten.'
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Ruby for optional Apple signing
+        if: inputs.sign_ipa
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Install project signing helper
+        if: inputs.sign_ipa
+        run: gem install xcodeproj -v 1.27.0 --no-document
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          if [ -d /Applications/Xcode_16.4.app/Contents/Developer ]; then
+            sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Install locked web dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build iPhone archive and IPA
+        id: build
+        shell: bash
+        env:
+          SIGN_IPA: ${{ inputs.sign_ipa }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          if [ "$SIGN_IPA" = 'true' ]; then
+            bash scripts/build-ios.sh --signed --export-method "$EXPORT_METHOD"
+          else
+            bash scripts/build-ios.sh --unsigned
+          fi
+
+      - name: Upload iPhone archive and IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.artifact_name }}
+          path: build/ios/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build diagnostics after failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nabd-iOS-build-diagnostics
+          path: build/ios/*.log
+          if-no-files-found: ignore
+          retention-days: 3
